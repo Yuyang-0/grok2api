@@ -29,3 +29,8 @@
    - Files: `app/api/v1/chat.py`, `app/services/grok/services/chat.py`
    - Behavior change: `messages[].content` now accepts a single object payload (e.g. `{"type":"text","text":"..."}`) in addition to string and array formats.
    - Expected result: clients that send object-form content (such as some OpenClaw request paths) no longer fail with `400 Input should be a valid string`.
+
+4. Added assistant null-content compatibility for OpenAI-like history payloads.
+   - File: `app/api/v1/chat.py`
+   - Behavior change: `messages[].content = null` is now accepted only when `role` is `assistant`.
+   - Expected result: clients that include assistant placeholder/tool-call history messages with null content no longer fail at request validation.

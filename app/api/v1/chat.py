@@ -27,7 +27,7 @@ class MessageItem(BaseModel):
     """消息项"""
 
     role: str
-    content: Union[str, Dict[str, Any], List[Dict[str, Any]]]
+    content: Optional[Union[str, Dict[str, Any], List[Dict[str, Any]]]]
 
 
 class VideoConfig(BaseModel):
@@ -204,6 +204,16 @@ def validate_request(request: ChatCompletionRequest):
                 code="invalid_role",
             )
         content = msg.content
+
+        # 兼容部分客户端会发送 assistant 空内容（例如工具调用中间态）
+        if content is None:
+            if msg.role == "assistant":
+                continue
+            raise ValidationException(
+                message="Message content cannot be null",
+                param=f"messages.{idx}.content",
+                code="empty_content",
+            )
 
         # 字符串内容
         if isinstance(content, str):
