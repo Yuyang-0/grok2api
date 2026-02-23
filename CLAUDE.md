@@ -24,3 +24,8 @@
    - File: `/Users/yuyangguan/Documents/personal/agent-skills/grok2api/scripts/chat.sh`
    - Behavior change: script now checks HTTP status and surfaces upstream error messages; exits non-zero on failures.
    - Also removed `eval` usage and switched request body generation to JSON-safe Python serialization.
+
+3. Added chat content object compatibility for OpenAI-like clients.
+   - Files: `app/api/v1/chat.py`, `app/services/grok/services/chat.py`
+   - Behavior change: `messages[].content` now accepts a single object payload (e.g. `{"type":"text","text":"..."}`) in addition to string and array formats.
+   - Expected result: clients that send object-form content (such as some OpenClaw request paths) no longer fail with `400 Input should be a valid string`.

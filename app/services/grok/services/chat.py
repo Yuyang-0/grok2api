@@ -118,6 +118,28 @@ class MessageExtractor:
             if isinstance(content, str):
                 if content.strip():
                     parts.append(content)
+            elif isinstance(content, dict):
+                content = [content]
+                for item in content:
+                    item_type = item.get("type", "")
+                    if item_type == "text":
+                        if text := item.get("text", "").strip():
+                            parts.append(text)
+                    elif item_type == "image_url":
+                        image_data = item.get("image_url", {})
+                        url = image_data.get("url", "")
+                        if url:
+                            image_attachments.append(url)
+                    elif item_type == "input_audio":
+                        audio_data = item.get("input_audio", {})
+                        data = audio_data.get("data", "")
+                        if data:
+                            file_attachments.append(data)
+                    elif item_type == "file":
+                        file_data = item.get("file", {})
+                        raw = file_data.get("file_data", "")
+                        if raw:
+                            file_attachments.append(raw)
             elif isinstance(content, list):
                 for item in content:
                     item_type = item.get("type", "")

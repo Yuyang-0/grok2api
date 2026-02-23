@@ -27,7 +27,7 @@ class MessageItem(BaseModel):
     """消息项"""
 
     role: str
-    content: Union[str, List[Dict[str, Any]]]
+    content: Union[str, Dict[str, Any], List[Dict[str, Any]]]
 
 
 class VideoConfig(BaseModel):
@@ -116,6 +116,8 @@ def _extract_prompt_images(messages: List[MessageItem]) -> tuple[str, List[str]]
             if text:
                 last_text = text
             continue
+        if isinstance(content, dict):
+            content = [content]
         if not isinstance(content, list):
             continue
         for block in content:
@@ -213,6 +215,31 @@ def validate_request(request: ChatCompletionRequest):
                 )
 
         # 列表内容
+        elif isinstance(content, dict):
+            content = [content]
+            for c_idx, item in enumerate(content):
+                if not isinstance(item, dict):
+                    raise ValidationException(
+                        message="Message content items must be objects",
+                        param=f"messages.{idx}.content.{c_idx}",
+                        code="invalid_content_item",
+                    )
+                item_type = item.get("type")
+                if item_type != "text":
+                    raise ValidationException(
+                        message="When content is an object, type must be 'text'",
+                        param=f"messages.{idx}.content.{c_idx}.type",
+                        code="invalid_content_type",
+                    )
+                text = item.get("text", "")
+                if not isinstance(text, str) or not text.strip():
+                    raise ValidationException(
+                        message="messages.%d.content.%d.text must be a non-empty string"
+                        % (idx, c_idx),
+                        param=f"messages.{idx}.content.{c_idx}.text",
+                        code="empty_content",
+                    )
+
         elif isinstance(content, list):
             if not content:
                 raise ValidationException(
