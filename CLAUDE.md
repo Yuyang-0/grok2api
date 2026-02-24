@@ -34,3 +34,11 @@
    - File: `app/api/v1/chat.py`
    - Behavior change: `messages[].content = null` is now accepted only when `role` is `assistant`.
    - Expected result: clients that include assistant placeholder/tool-call history messages with null content no longer fail at request validation.
+
+5. Added tool-call session compatibility for OpenAI-like clients.
+   - Files: `app/api/v1/chat.py`, `app/services/grok/services/chat.py`
+   - Behavior change:
+     - `role=tool` is now accepted.
+     - `MessageItem` preserves `tool_calls` / `tool_call_id` / `name` fields.
+     - Extractor now keeps tool-call traces and tool message identity in context text.
+   - Expected result: multi-turn non-fresh sessions with tool-calling history are less likely to fail validation or lose ordering context.
