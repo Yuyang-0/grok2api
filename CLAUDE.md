@@ -42,3 +42,14 @@
      - `MessageItem` preserves `tool_calls` / `tool_call_id` / `name` fields.
      - Extractor now keeps tool-call traces and tool message identity in context text.
    - Expected result: multi-turn non-fresh sessions with tool-calling history are less likely to fail validation or lose ordering context.
+
+6. Added real tools request pass-through and tool-call shaping for chat completions.
+   - Files: `app/api/v1/chat.py`, `app/services/grok/services/chat.py`, `app/services/grok/utils/response.py`
+   - Behavior change:
+     - `/v1/chat/completions` now accepts and validates `tools` / `tool_choice`, and forwards them through `ChatService -> GrokChatService`.
+     - Requests include tool metadata in upstream overrides (`openaiTools`, `openaiToolChoice`) and prompt-side fallback instruction.
+     - Non-stream responses now attempt to parse JSON tool-call outputs and map them to OpenAI-compatible `message.tool_calls` with `finish_reason="tool_calls"`.
+   - Validation/test notes:
+     - Local syntax check passed via `python3 -m py_compile` on modified files.
+     - Chat tools test request model: `grok-4.1-fast`.
+     - Real local API request with tools successfully passed request validation and entered upstream path; current runtime environment returned upstream TLS failure (`curl: (60) SSL: no alternative certificate subject name matches target hostname 'grok.com'`), so no successful upstream content sample was obtained in this run.

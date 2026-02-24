@@ -71,6 +71,8 @@ def make_chat_response(
     response_id: Optional[str] = None,
     index: int = 0,
     usage: Optional[dict] = None,
+    tool_calls: Optional[list] = None,
+    finish_reason: str = "stop",
 ) -> dict:
     """
     Create an OpenAI-compatible non-streaming chat completion response.
@@ -96,6 +98,15 @@ def make_chat_response(
             "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
         }
 
+    message = {
+        "role": "assistant",
+        "content": content,
+        "refusal": None,
+    }
+    if tool_calls:
+        message["content"] = None
+        message["tool_calls"] = tool_calls
+
     return {
         "id": response_id,
         "object": "chat.completion",
@@ -104,12 +115,8 @@ def make_chat_response(
         "choices": [
             {
                 "index": index,
-                "message": {
-                    "role": "assistant",
-                    "content": content,
-                    "refusal": None,
-                },
-                "finish_reason": "stop",
+                "message": message,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": usage,

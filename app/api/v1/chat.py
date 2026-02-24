@@ -58,6 +58,12 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: Optional[str] = Field(None, description="推理强度: none/minimal/low/medium/high/xhigh")
     temperature: Optional[float] = Field(0.8, description="采样温度: 0-2")
     top_p: Optional[float] = Field(0.95, description="nucleus 采样: 0-1")
+    tools: Optional[List[Dict[str, Any]]] = Field(
+        None, description="工具定义（OpenAI function calling）"
+    )
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = Field(
+        None, description="工具选择策略: auto/none/required 或 function 指定"
+    )
     # 视频生成配置
     video_config: Optional[VideoConfig] = Field(None, description="视频生成参数")
     # 图片生成配置
@@ -188,6 +194,80 @@ def _validate_image_config(image_conf: ImageConfig, *, stream: bool):
             param="image_config.size",
             code="invalid_size",
         )
+
+
+def _validate_tools(request: ChatCompletionRequest):
+    if request.tools is not None:
+        if not isinstance(request.tools, list):
+            raise ValidationException(
+                message="tools must be an array",
+                param="tools",
+                code="invalid_tools",
+            )
+        for idx, tool in enumerate(request.tools):
+            if not isinstance(tool, dict):
+                raise ValidationException(
+                    message="tool item must be an object",
+                    param=f"tools.{idx}",
+                    code="invalid_tool",
+                )
+            if tool.get("type") != "function":
+                raise ValidationException(
+                    message="only function tools are supported",
+                    param=f"tools.{idx}.type",
+                    code="invalid_tool_type",
+                )
+            fn = tool.get("function")
+            if not isinstance(fn, dict):
+                raise ValidationException(
+                    message="tool.function must be an object",
+                    param=f"tools.{idx}.function",
+                    code="missing_function",
+                )
+            name = fn.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ValidationException(
+                    message="tool.function.name must be a non-empty string",
+                    param=f"tools.{idx}.function.name",
+                    code="invalid_function_name",
+                )
+
+    if request.tool_choice is not None:
+        tc = request.tool_choice
+        if isinstance(tc, str):
+            if tc not in {"none", "auto", "required"}:
+                raise ValidationException(
+                    message="tool_choice must be one of none/auto/required or a function object",
+                    param="tool_choice",
+                    code="invalid_tool_choice",
+                )
+        elif isinstance(tc, dict):
+            if tc.get("type") != "function":
+                raise ValidationException(
+                    message="tool_choice.type must be function",
+                    param="tool_choice.type",
+                    code="invalid_tool_choice",
+                )
+            fn = tc.get("function")
+            if not isinstance(fn, dict):
+                raise ValidationException(
+                    message="tool_choice.function must be an object",
+                    param="tool_choice.function",
+                    code="invalid_tool_choice",
+                )
+            name = fn.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ValidationException(
+                    message="tool_choice.function.name must be a non-empty string",
+                    param="tool_choice.function.name",
+                    code="invalid_tool_choice",
+                )
+        else:
+            raise ValidationException(
+                message="tool_choice must be a string or object",
+                param="tool_choice",
+                code="invalid_tool_choice",
+            )
 def validate_request(request: ChatCompletionRequest):
     """验证请求参数"""
     # 验证模型
@@ -437,6 +517,8 @@ def validate_request(request: ChatCompletionRequest):
                 param="top_p",
                 code="invalid_top_p",
             )
+
+    _validate_tools(request)
 
     model_info = ModelService.get(request.model)
     # image 验证
@@ -700,6 +782,8 @@ async def chat_completions(request: ChatCompletionRequest):
             reasoning_effort=request.reasoning_effort,
             temperature=request.temperature,
             top_p=request.top_p,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
         )
 
     if isinstance(result, dict):

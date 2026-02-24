@@ -5,7 +5,7 @@ Grok Chat 服务
 import asyncio
 import re
 import uuid
-from typing import Dict, List, Any, AsyncGenerator, AsyncIterable
+from typing import Dict, List, Any, AsyncGenerator, AsyncIterable, Optional
 
 import orjson
 from curl_cffi.requests.errors import RequestsError
@@ -220,6 +220,133 @@ class MessageExtractor:
         return "\n\n".join(texts), file_attachments, image_attachments
 
 
+def _build_tool_instruction(
+    tools: List[Dict[str, Any]], tool_choice: Optional[Any]
+) -> str:
+    """Build a lightweight tool-calling instruction for models that only accept plain text prompts."""
+    tool_lines = []
+    for tool in tools or []:
+        fn = tool.get("function", {}) if isinstance(tool, dict) else {}
+        name = fn.get("name", "tool")
+        desc = fn.get("description", "")
+        params = fn.get("parameters", {})
+        try:
+            params_text = orjson.dumps(params).decode()
+        except Exception:
+            params_text = str(params)
+        line = f"- {name}: {desc}\n  parameters={params_text}"
+        tool_lines.append(line)
+
+    choice_hint = "auto"
+    if isinstance(tool_choice, str):
+        choice_hint = tool_choice
+    elif isinstance(tool_choice, dict):
+        fn = tool_choice.get("function", {}) if isinstance(tool_choice, dict) else {}
+        forced_name = fn.get("name")
+        if isinstance(forced_name, str) and forced_name.strip():
+            choice_hint = f"force:{forced_name.strip()}"
+
+    return (
+        "TOOL_CALLING_MODE=ON\n"
+        f"TOOL_CHOICE={choice_hint}\n"
+        "AVAILABLE_TOOLS:\n"
+        + "\n".join(tool_lines)
+        + "\n"
+        "When a tool call is needed, respond with JSON only.\n"
+        'JSON format: {"tool_calls":[{"name":"<tool_name>","arguments":{...}}]}\n'
+        "If no tool is needed, reply normally."
+    )
+
+
+def _extract_tool_calls_from_content(
+    content: Any,
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    """Parse tool_calls from model text output."""
+    if not isinstance(content, str) or not content.strip():
+        return None
+
+    allowed_names = set()
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function")
+        if isinstance(fn, dict):
+            name = fn.get("name")
+            if isinstance(name, str) and name.strip():
+                allowed_names.add(name.strip())
+
+    candidates = [content.strip()]
+    for m in re.finditer(r"```(?:json)?\s*([\s\S]*?)```", content):
+        block = m.group(1).strip()
+        if block:
+            candidates.append(block)
+
+    for candidate in candidates:
+        try:
+            parsed = orjson.loads(candidate)
+        except orjson.JSONDecodeError:
+            continue
+
+        raw_calls = None
+        if isinstance(parsed, dict):
+            if isinstance(parsed.get("tool_calls"), list):
+                raw_calls = parsed.get("tool_calls")
+            elif "name" in parsed and "arguments" in parsed:
+                raw_calls = [parsed]
+            elif isinstance(parsed.get("function"), dict):
+                raw_calls = [parsed.get("function")]
+        elif isinstance(parsed, list):
+            raw_calls = parsed
+
+        if not isinstance(raw_calls, list) or not raw_calls:
+            continue
+
+        tool_calls: List[Dict[str, Any]] = []
+        for call in raw_calls:
+            if not isinstance(call, dict):
+                continue
+
+            fn_data = call.get("function")
+            if isinstance(fn_data, dict):
+                name = fn_data.get("name")
+                arguments = fn_data.get("arguments", {})
+            else:
+                name = call.get("name")
+                arguments = call.get("arguments", {})
+
+            if not isinstance(name, str) or not name.strip():
+                continue
+            name = name.strip()
+            if allowed_names and name not in allowed_names:
+                continue
+
+            if isinstance(arguments, str):
+                arguments_str = arguments
+            else:
+                try:
+                    arguments_str = orjson.dumps(arguments).decode()
+                except Exception:
+                    arguments_str = "{}"
+
+            call_id = call.get("id")
+            if not isinstance(call_id, str) or not call_id.strip():
+                call_id = f"call_{uuid.uuid4().hex[:24]}"
+
+            tool_calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments_str},
+                }
+            )
+
+        if tool_calls:
+            return tool_calls
+
+    return None
+
+
 class GrokChatService:
     """Grok API 调用服务"""
 
@@ -279,6 +406,8 @@ class GrokChatService:
         reasoning_effort: str | None = None,
         temperature: float = 0.8,
         top_p: float = 0.95,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
     ):
         """OpenAI 兼容接口"""
         model_info = ModelService.get(model)
@@ -289,6 +418,9 @@ class GrokChatService:
         mode = model_info.model_mode
         # 提取消息和附件
         message, file_attachments, image_attachments = MessageExtractor.extract(messages)
+        if tools:
+            instruction = _build_tool_instruction(tools, tool_choice)
+            message = f"{message}\n\n{instruction}" if message else instruction
         logger.debug(
             "Extracted message length=%s, files=%s, images=%s",
             len(message),
@@ -322,6 +454,10 @@ class GrokChatService:
         }
         if reasoning_effort is not None:
             model_config_override["reasoningEffort"] = reasoning_effort
+        if tools:
+            model_config_override["openaiTools"] = tools
+        if tool_choice is not None:
+            model_config_override["openaiToolChoice"] = tool_choice
 
         response = await self.chat(
             token,
@@ -330,6 +466,7 @@ class GrokChatService:
             mode,
             stream,
             file_attachments=all_attachments,
+            tool_overrides={"openaiTools": tools or [], "openaiToolChoice": tool_choice},
             model_config_override=model_config_override,
         )
 
@@ -347,6 +484,8 @@ class ChatService:
         reasoning_effort: str | None = None,
         temperature: float = 0.8,
         top_p: float = 0.95,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
     ):
         """Chat Completions 入口"""
         # 获取 token
@@ -391,6 +530,8 @@ class ChatService:
                     reasoning_effort=reasoning_effort,
                     temperature=temperature,
                     top_p=top_p,
+                    tools=tools,
+                    tool_choice=tool_choice,
                 )
 
                 # 处理响应
@@ -404,6 +545,23 @@ class ChatService:
                 # 非流式
                 logger.debug(f"Processing non-stream response: model={model}")
                 result = await CollectProcessor(model_name, token).process(response)
+                if tools:
+                    choices = result.get("choices")
+                    choice = choices[0] if isinstance(choices, list) and choices else {}
+                    message_obj = (
+                        choice.get("message", {}) if isinstance(choice, dict) else {}
+                    )
+                    content = (
+                        message_obj.get("content")
+                        if isinstance(message_obj, dict)
+                        else None
+                    )
+                    tool_calls = _extract_tool_calls_from_content(content, tools)
+                    if tool_calls and isinstance(message_obj, dict):
+                        message_obj["content"] = None
+                        message_obj["tool_calls"] = tool_calls
+                        if isinstance(choice, dict):
+                            choice["finish_reason"] = "tool_calls"
                 try:
                     model_info = ModelService.get(model)
                     effort = (
