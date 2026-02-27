@@ -26,6 +26,13 @@ from app.services.grok.utils.retry import pick_token, rate_limited
 from app.services.reverse.app_chat import AppChatReverse
 from app.services.reverse.utils.session import ResettableSession
 from app.services.grok.utils.stream import wrap_stream_with_usage
+from app.services.grok.utils.tool_call import (
+    build_tool_prompt,
+    parse_tool_calls,
+    parse_tool_call_block,
+    build_tool_overrides,
+    format_tool_history,
+)
 from app.services.token import get_token_manager, EffortType
 
 
@@ -103,8 +110,17 @@ class MessageExtractor:
     """消息内容提取器"""
 
     @staticmethod
-    def extract(messages: List[Dict[str, Any]]) -> tuple[str, List[str], List[str]]:
+    def extract(
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]] = None,
+        tool_choice: Any = None,
+        parallel_tool_calls: bool = True,
+    ) -> tuple[str, List[str], List[str]]:
         """从 OpenAI 消息格式提取内容，返回 (text, file_attachments, image_attachments)"""
+        # Pre-process: convert tool-related messages to text format
+        if tools:
+            messages = format_tool_history(messages)
+
         texts = []
         file_attachments: List[str] = []
         image_attachments: List[str] = []
@@ -217,7 +233,19 @@ class MessageExtractor:
             text = item["text"]
             texts.append(text if i == last_user_index else f"{role}: {text}")
 
-        return "\n\n".join(texts), file_attachments, image_attachments
+        combined = "\n\n".join(texts)
+
+        # If there are attachments but no text, inject a fallback prompt.
+        if (not combined.strip()) and (file_attachments or image_attachments):
+            combined = "Refer to the following content:"
+
+        # Prepend tool system prompt if tools are provided
+        if tools:
+            tool_prompt = build_tool_prompt(tools, tool_choice, parallel_tool_calls)
+            if tool_prompt:
+                combined = f"{tool_prompt}\n\n{combined}"
+
+        return combined, file_attachments, image_attachments
 
 
 def _build_tool_instruction(
@@ -370,30 +398,35 @@ class GrokChatService:
         )
 
         browser = get_config("proxy.browser")
+        semaphore = _get_chat_semaphore()
+        await semaphore.acquire()
+        session = ResettableSession(impersonate=browser)
+        try:
+            stream_response = await AppChatReverse.request(
+                session,
+                token,
+                message=message,
+                model=model,
+                mode=mode,
+                file_attachments=file_attachments,
+                tool_overrides=tool_overrides,
+                model_config_override=model_config_override,
+            )
+            logger.info(f"Chat connected: model={model}, stream={stream}")
+        except Exception:
+            try:
+                await session.close()
+            except Exception:
+                pass
+            semaphore.release()
+            raise
 
         async def _stream():
-            session = ResettableSession(impersonate=browser)
             try:
-                async with _get_chat_semaphore():
-                    stream_response = await AppChatReverse.request(
-                        session,
-                        token,
-                        message=message,
-                        model=model,
-                        mode=mode,
-                        file_attachments=file_attachments,
-                        tool_overrides=tool_overrides,
-                        model_config_override=model_config_override,
-                    )
-                    logger.info(f"Chat connected: model={model}, stream={stream}")
-                    async for line in stream_response:
-                        yield line
-            except Exception:
-                try:
-                    await session.close()
-                except Exception:
-                    pass
-                raise
+                async for line in stream_response:
+                    yield line
+            finally:
+                semaphore.release()
 
         return _stream()
 
@@ -408,6 +441,7 @@ class GrokChatService:
         top_p: float = 0.95,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Any] = None,
+        parallel_tool_calls: bool = True,
     ):
         """OpenAI 兼容接口"""
         model_info = ModelService.get(model)
@@ -417,10 +451,9 @@ class GrokChatService:
         grok_model = model_info.grok_model
         mode = model_info.model_mode
         # 提取消息和附件
-        message, file_attachments, image_attachments = MessageExtractor.extract(messages)
-        if tools:
-            instruction = _build_tool_instruction(tools, tool_choice)
-            message = f"{message}\n\n{instruction}" if message else instruction
+        message, file_attachments, image_attachments = MessageExtractor.extract(
+            messages, tools=tools, tool_choice=tool_choice, parallel_tool_calls=parallel_tool_calls
+        )
         logger.debug(
             "Extracted message length=%s, files=%s, images=%s",
             len(message),
@@ -459,6 +492,11 @@ class GrokChatService:
         if tool_choice is not None:
             model_config_override["openaiToolChoice"] = tool_choice
 
+        # Passthrough mode: build tool_overrides for Grok API
+        tool_overrides_payload = None
+        if tools and get_config("app.tool_call_mode") == "passthrough":
+            tool_overrides_payload = build_tool_overrides(tools)
+
         response = await self.chat(
             token,
             message,
@@ -466,7 +504,7 @@ class GrokChatService:
             mode,
             stream,
             file_attachments=all_attachments,
-            tool_overrides={"openaiTools": tools or [], "openaiToolChoice": tool_choice},
+            tool_overrides=tool_overrides_payload,
             model_config_override=model_config_override,
         )
 
@@ -486,6 +524,7 @@ class ChatService:
         top_p: float = 0.95,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Any] = None,
+        parallel_tool_calls: bool = True,
     ):
         """Chat Completions 入口"""
         # 获取 token
@@ -532,36 +571,20 @@ class ChatService:
                     top_p=top_p,
                     tools=tools,
                     tool_choice=tool_choice,
+                    parallel_tool_calls=parallel_tool_calls,
                 )
 
                 # 处理响应
                 if is_stream:
                     logger.debug(f"Processing stream response: model={model}")
-                    processor = StreamProcessor(model_name, token, show_think)
+                    processor = StreamProcessor(model_name, token, show_think, tools=tools, tool_choice=tool_choice)
                     return wrap_stream_with_usage(
                         processor.process(response), token_mgr, token, model
                     )
 
                 # 非流式
                 logger.debug(f"Processing non-stream response: model={model}")
-                result = await CollectProcessor(model_name, token).process(response)
-                if tools:
-                    choices = result.get("choices")
-                    choice = choices[0] if isinstance(choices, list) and choices else {}
-                    message_obj = (
-                        choice.get("message", {}) if isinstance(choice, dict) else {}
-                    )
-                    content = (
-                        message_obj.get("content")
-                        if isinstance(message_obj, dict)
-                        else None
-                    )
-                    tool_calls = _extract_tool_calls_from_content(content, tools)
-                    if tool_calls and isinstance(message_obj, dict):
-                        message_obj["content"] = None
-                        message_obj["tool_calls"] = tool_calls
-                        if isinstance(choice, dict):
-                            choice["finish_reason"] = "tool_calls"
+                result = await CollectProcessor(model_name, token, tools=tools, tool_choice=tool_choice).process(response)
                 try:
                     model_info = ModelService.get(model)
                     effort = (
@@ -604,7 +627,7 @@ class ChatService:
 class StreamProcessor(proc_base.BaseProcessor):
     """Stream response processor."""
 
-    def __init__(self, model: str, token: str = "", show_think: bool = None):
+    def __init__(self, model: str, token: str = "", show_think: bool = None, tools: List[Dict[str, Any]] = None, tool_choice: Any = None):
         super().__init__(model, token)
         self.response_id: str = None
         self.fingerprint: str = ""
@@ -620,6 +643,13 @@ class StreamProcessor(proc_base.BaseProcessor):
         self._tool_usage_buffer = ""
 
         self.show_think = bool(show_think)
+        self.tools = tools
+        self.tool_choice = tool_choice
+        self._tool_stream_enabled = bool(tools) and tool_choice != "none"
+        self._tool_state = "text"
+        self._tool_buffer = ""
+        self._tool_partial = ""
+        self._tool_calls_seen = False
 
     def _filter_tool_card(self, token: str) -> str:
         if not token or not self.tool_usage_enabled:
@@ -694,12 +724,91 @@ class StreamProcessor(proc_base.BaseProcessor):
 
         return token
 
-    def _sse(self, content: str = "", role: str = None, finish: str = None) -> str:
+    def _suffix_prefix(self, text: str, tag: str) -> int:
+        if not text or not tag:
+            return 0
+        max_keep = min(len(text), len(tag) - 1)
+        for keep in range(max_keep, 0, -1):
+            if text.endswith(tag[:keep]):
+                return keep
+        return 0
+
+    def _handle_tool_stream(self, chunk: str) -> list[tuple[str, Any]]:
+        events: list[tuple[str, Any]] = []
+        if not chunk:
+            return events
+
+        start_tag = "<tool_call>"
+        end_tag = "</tool_call>"
+        data = f"{self._tool_partial}{chunk}"
+        self._tool_partial = ""
+
+        while data:
+            if self._tool_state == "text":
+                start_idx = data.find(start_tag)
+                if start_idx == -1:
+                    keep = self._suffix_prefix(data, start_tag)
+                    emit = data[:-keep] if keep else data
+                    if emit:
+                        events.append(("text", emit))
+                    self._tool_partial = data[-keep:] if keep else ""
+                    break
+
+                before = data[:start_idx]
+                if before:
+                    events.append(("text", before))
+                data = data[start_idx + len(start_tag) :]
+                self._tool_state = "tool"
+                continue
+
+            end_idx = data.find(end_tag)
+            if end_idx == -1:
+                keep = self._suffix_prefix(data, end_tag)
+                append = data[:-keep] if keep else data
+                if append:
+                    self._tool_buffer += append
+                self._tool_partial = data[-keep:] if keep else ""
+                break
+
+            self._tool_buffer += data[:end_idx]
+            data = data[end_idx + len(end_tag) :]
+            tool_call = parse_tool_call_block(self._tool_buffer, self.tools)
+            if tool_call:
+                events.append(("tool", tool_call))
+                self._tool_calls_seen = True
+            self._tool_buffer = ""
+            self._tool_state = "text"
+
+        return events
+
+    def _flush_tool_stream(self) -> list[tuple[str, Any]]:
+        events: list[tuple[str, Any]] = []
+        if self._tool_state == "text":
+            if self._tool_partial:
+                events.append(("text", self._tool_partial))
+                self._tool_partial = ""
+            return events
+
+        raw = f"{self._tool_buffer}{self._tool_partial}"
+        tool_call = parse_tool_call_block(raw, self.tools)
+        if tool_call:
+            events.append(("tool", tool_call))
+            self._tool_calls_seen = True
+        elif raw:
+            events.append(("text", f"<tool_call>{raw}"))
+        self._tool_buffer = ""
+        self._tool_partial = ""
+        self._tool_state = "text"
+        return events
+
+    def _sse(self, content: str = "", role: str = None, finish: str = None, tool_calls: list = None) -> str:
         """Build SSE response."""
         delta = {}
         if role:
             delta["role"] = role
             delta["content"] = ""
+        elif tool_calls is not None:
+            delta["tool_calls"] = tool_calls
         elif content:
             delta["content"] = content
 
@@ -717,7 +826,7 @@ class StreamProcessor(proc_base.BaseProcessor):
 
     async def process(self, response: AsyncIterable[bytes]) -> AsyncGenerator[str, None]:
         """Process stream response.
-        
+
         Args:
             response: AsyncIterable[bytes], async iterable of bytes
 
@@ -826,11 +935,35 @@ class StreamProcessor(proc_base.BaseProcessor):
                         if self.think_opened:
                             yield self._sse("\n</think>\n")
                             self.think_opened = False
+
+                    if in_think:
+                        yield self._sse(filtered)
+                        continue
+
+                    if self._tool_stream_enabled:
+                        for kind, payload in self._handle_tool_stream(filtered):
+                            if kind == "text":
+                                yield self._sse(payload)
+                            elif kind == "tool":
+                                yield self._sse(tool_calls=[payload])
+                        continue
+
                     yield self._sse(filtered)
 
             if self.think_opened:
                 yield self._sse("</think>\n")
-            yield self._sse(finish="stop")
+
+            if self._tool_stream_enabled:
+                for kind, payload in self._flush_tool_stream():
+                    if kind == "text":
+                        yield self._sse(payload)
+                    elif kind == "tool":
+                        yield self._sse(tool_calls=[payload])
+                finish_reason = "tool_calls" if self._tool_calls_seen else "stop"
+                yield self._sse(finish=finish_reason)
+            else:
+                yield self._sse(finish="stop")
+
             yield "data: [DONE]\n\n"
         except asyncio.CancelledError:
             logger.debug("Stream cancelled by client", extra={"model": self.model})
@@ -871,9 +1004,11 @@ class StreamProcessor(proc_base.BaseProcessor):
 class CollectProcessor(proc_base.BaseProcessor):
     """Non-stream response processor."""
 
-    def __init__(self, model: str, token: str = ""):
+    def __init__(self, model: str, token: str = "", tools: List[Dict[str, Any]] = None, tool_choice: Any = None):
         super().__init__(model, token)
         self.filter_tags = get_config("app.filter_tags")
+        self.tools = tools
+        self.tool_choice = tool_choice
 
     def _filter_content(self, content: str) -> str:
         """Filter special tags in content."""
@@ -1033,6 +1168,25 @@ class CollectProcessor(proc_base.BaseProcessor):
 
         content = self._filter_content(content)
 
+        # Parse for tool calls if tools were provided
+        finish_reason = "stop"
+        tool_calls_result = None
+        if self.tools and self.tool_choice != "none":
+            text_content, tool_calls_list = parse_tool_calls(content, self.tools)
+            if tool_calls_list:
+                tool_calls_result = tool_calls_list
+                content = text_content  # May be None
+                finish_reason = "tool_calls"
+
+        message_obj = {
+            "role": "assistant",
+            "content": content,
+            "refusal": None,
+            "annotations": [],
+        }
+        if tool_calls_result:
+            message_obj["tool_calls"] = tool_calls_result
+
         return {
             "id": response_id,
             "object": "chat.completion",
@@ -1042,13 +1196,8 @@ class CollectProcessor(proc_base.BaseProcessor):
             "choices": [
                 {
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": content,
-                        "refusal": None,
-                        "annotations": [],
-                    },
-                    "finish_reason": "stop",
+                    "message": message_obj,
+                    "finish_reason": finish_reason,
                 }
             ],
             "usage": {
